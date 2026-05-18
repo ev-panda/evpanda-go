@@ -37,7 +37,7 @@ jobs:
       # golangci-lint v2 (v6 is the last v1 line); version pinned to match
       # the v2 config schema in .golangci.yml.
       - if: matrix.go == 'stable'
-        uses: golangci/golangci-lint-action@v7
+        uses: golangci/golangci-lint-action@v9
         with:
           version: v2.10.1
 
