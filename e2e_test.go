@@ -59,8 +59,11 @@ func startMockUpstream() *mockUpstream {
 			}
 		}
 		raw, _ := io.ReadAll(reader)
-		var records []map[string]any
-		_ = json.Unmarshal(raw, &records)
+		var body struct {
+			Messages []map[string]any `json:"messages"`
+		}
+		_ = json.Unmarshal(raw, &body)
+		records := body.Messages
 
 		m.mu.Lock()
 		m.received = append(m.received, received{
@@ -140,18 +143,8 @@ func makeOCPI(i int) evpanda.OCPIMessage {
 			RequestHeaders:  map[string]string{"Authorization": "Bearer SECRET", "X-Trace": strconv.Itoa(i)},
 			ResponseHeaders: map[string]string{"content-type": "application/json"},
 			RequestBody:     []byte("body-" + strconv.Itoa(i)),
-			Truncated:       false,
 		},
 	}
-}
-
-func httpOf(t *testing.T, rec map[string]any) map[string]any {
-	t.Helper()
-	h, ok := rec["http"].(map[string]any)
-	if !ok {
-		t.Fatalf("record has no http object: %v", rec)
-	}
-	return h
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────
@@ -160,7 +153,7 @@ func TestCaptureBatchRedactRoute(t *testing.T) {
 	mock := startMockUpstream()
 	defer mock.close()
 
-	sdk, err := evpanda.Start(evpanda.Config{
+	panda, err := evpanda.Start(evpanda.Config{
 		NetworkType:   evpanda.ProtocolOCPI,
 		Endpoint:      mock.server.URL,
 		APIKey:        "test-key",
@@ -169,17 +162,17 @@ func TestCaptureBatchRedactRoute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned unexpected error: %v", err)
 	}
-	defer sdk.Close()
+	defer panda.Close()
 
 	for i := 0; i < 3; i++ {
-		sdk.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(makeOCPI(i))
 	}
 
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == 3 }, 3*time.Second)
 
 	recs := mock.ocpiRecords()
 	sort.Slice(recs, func(a, b int) bool {
-		return httpOf(t, recs[a])["url"].(string) < httpOf(t, recs[b])["url"].(string)
+		return recs[a]["url"].(string) < recs[b]["url"].(string)
 	})
 	if len(recs) != 3 {
 		t.Fatalf("want 3 records, got %d", len(recs))
@@ -197,18 +190,21 @@ func TestCaptureBatchRedactRoute(t *testing.T) {
 
 	tsRe := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`)
 	for i, rec := range recs {
-		if rec["protocol"] != "ocpi" {
-			t.Fatalf("protocol = %v, want ocpi", rec["protocol"])
+		// Flat ingestion shape: no nested http/identity, no protocol.
+		if !tsRe.MatchString(rec["captured_at"].(string)) {
+			t.Fatalf("captured_at %q not ISO-millis-Z", rec["captured_at"])
 		}
-		if !tsRe.MatchString(rec["capturedAt"].(string)) {
-			t.Fatalf("capturedAt %q not ISO-millis-Z", rec["capturedAt"])
+		if rec["url"] != "/ocpi/2.2/cdrs/"+strconv.Itoa(i) {
+			t.Fatalf("url = %v", rec["url"])
 		}
-		h := httpOf(t, rec)
-		if h["url"] != "/ocpi/2.2/cdrs/"+strconv.Itoa(i) {
-			t.Fatalf("url = %v", h["url"])
+		if rec["platform_id"] != "acme" || rec["http_method"] != "POST" {
+			t.Fatalf("platform_id/http_method = %v / %v", rec["platform_id"], rec["http_method"])
+		}
+		if rec["response_status_code"].(float64) != 200 {
+			t.Fatalf("response_status_code = %v, want 200", rec["response_status_code"])
 		}
 		// Redaction: Authorization stripped (case-insensitive), others kept.
-		reqHeaders := h["requestHeaders"].(map[string]any)
+		reqHeaders := rec["request_headers"].(map[string]any)
 		for k := range reqHeaders {
 			if k == "Authorization" || k == "authorization" {
 				t.Fatalf("Authorization header was not redacted")
@@ -217,10 +213,10 @@ func TestCaptureBatchRedactRoute(t *testing.T) {
 		if reqHeaders["X-Trace"] != strconv.Itoa(i) {
 			t.Fatalf("X-Trace = %v, want %d", reqHeaders["X-Trace"], i)
 		}
-		// Binary body round-trips as base64.
-		decoded, err := base64.StdEncoding.DecodeString(h["requestBody"].(string))
+		// Body round-trips as base64.
+		decoded, err := base64.StdEncoding.DecodeString(rec["request_body"].(string))
 		if err != nil || string(decoded) != "body-"+strconv.Itoa(i) {
-			t.Fatalf("requestBody round-trip failed: %v / %q", err, decoded)
+			t.Fatalf("request_body round-trip failed: %v / %q", err, decoded)
 		}
 	}
 }
@@ -229,7 +225,7 @@ func TestGzipAndChunking(t *testing.T) {
 	mock := startMockUpstream()
 	defer mock.close()
 
-	sdk, err := evpanda.Start(evpanda.Config{
+	panda, err := evpanda.Start(evpanda.Config{
 		NetworkType:    evpanda.ProtocolOCPI,
 		Endpoint:       mock.server.URL,
 		APIKey:         "k",
@@ -240,11 +236,11 @@ func TestGzipAndChunking(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned unexpected error: %v", err)
 	}
-	defer sdk.Close()
+	defer panda.Close()
 
 	const n = 2500
 	for i := 0; i < n; i++ {
-		sdk.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(makeOCPI(i))
 	}
 
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == n }, 8*time.Second)
@@ -265,7 +261,7 @@ func TestGzipAndChunking(t *testing.T) {
 
 	// FIFO order preserved across the chunked POSTs.
 	for i, rec := range mock.ocpiRecords() {
-		if got := httpOf(t, rec)["url"]; got != "/ocpi/2.2/cdrs/"+strconv.Itoa(i) {
+		if got := rec["url"]; got != "/ocpi/2.2/cdrs/"+strconv.Itoa(i) {
 			t.Fatalf("order broken at %d: %v", i, got)
 		}
 	}
@@ -275,7 +271,7 @@ func TestDropOldest(t *testing.T) {
 	mock := startMockUpstream()
 	defer mock.close()
 
-	sdk, err := evpanda.Start(evpanda.Config{
+	panda, err := evpanda.Start(evpanda.Config{
 		NetworkType:    evpanda.ProtocolOCPI,
 		Endpoint:       mock.server.URL,
 		APIKey:         "k",
@@ -285,18 +281,18 @@ func TestDropOldest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned unexpected error: %v", err)
 	}
-	defer sdk.Close()
+	defer panda.Close()
 
 	for i := 0; i < 12; i++ { // 0..11
-		sdk.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(makeOCPI(i))
 	}
-	sdk.Flush() // force one drain
+	panda.Flush() // force one drain
 
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == 5 }, 3*time.Second)
 
 	var urls []string
 	for _, rec := range mock.ocpiRecords() {
-		urls = append(urls, httpOf(t, rec)["url"].(string))
+		urls = append(urls, rec["url"].(string))
 	}
 	sort.Strings(urls)
 	want := []string{
@@ -317,7 +313,7 @@ func TestFlushOnClose(t *testing.T) {
 	mock := startMockUpstream()
 	defer mock.close()
 
-	sdk, err := evpanda.Start(evpanda.Config{
+	panda, err := evpanda.Start(evpanda.Config{
 		NetworkType:   evpanda.ProtocolOCPI,
 		Endpoint:      mock.server.URL,
 		APIKey:        "k",
@@ -328,13 +324,13 @@ func TestFlushOnClose(t *testing.T) {
 	}
 
 	for i := 0; i < 4; i++ {
-		sdk.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(makeOCPI(i))
 	}
 	if len(mock.ocpiRecords()) != 0 {
 		t.Fatalf("nothing should be sent yet, got %d", len(mock.ocpiRecords()))
 	}
 
-	if err := sdk.Close(); err != nil { // graceful drain, clean → nil
+	if err := panda.Close(); err != nil { // graceful drain, clean → nil
 		t.Fatalf("Close on a clean drain returned %v, want nil", err)
 	}
 
@@ -346,7 +342,7 @@ func TestNeverPanicsWhenUpstreamFails(t *testing.T) {
 	defer mock.close()
 
 	mock.setStatus(http.StatusBadRequest) // permanent reject → dropped
-	sdk, err := evpanda.Start(evpanda.Config{
+	panda, err := evpanda.Start(evpanda.Config{
 		NetworkType:   evpanda.ProtocolOCPI,
 		Endpoint:      mock.server.URL,
 		APIKey:        "k",
@@ -355,43 +351,43 @@ func TestNeverPanicsWhenUpstreamFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start returned unexpected error: %v", err)
 	}
-	defer sdk.Close()
+	defer panda.Close()
 
 	// Capture during a failing upstream — must not panic.
 	for i := 0; i < 3; i++ {
-		sdk.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(makeOCPI(i))
 	}
 	// Malformed customer input — must not panic either (facade recovers).
-	sdk.CaptureOCPI(evpanda.OCPIMessage{}) // invalid identity
-	sdk.CaptureOCPP(evpanda.OCPPMessage{}) // invalid identity
-	sdk.CaptureOCPI(makeOCPI(99))          // still usable
+	panda.CaptureOCPI(evpanda.OCPIMessage{}) // invalid identity
+	panda.CaptureOCPP(evpanda.OCPPMessage{}) // invalid identity
+	panda.CaptureOCPI(makeOCPI(99))          // still usable
 
-	sdk.Flush() // resolves even though the upstream 400s
+	panda.Flush() // resolves even though the upstream 400s
 
 	if len(mock.ocpiPosts()) == 0 {
 		t.Fatalf("expected at least one delivery attempt")
 	}
 	// Still usable afterwards.
-	sdk.CaptureOCPI(makeOCPI(100))
-	sdk.Flush()
+	panda.CaptureOCPI(makeOCPI(100))
+	panda.Flush()
 }
 
 // Start with a bad config must return an inert (no-op) SDK, never panic.
 func TestBadConfigIsInert(t *testing.T) {
-	sdk, err := evpanda.Start(evpanda.Config{Endpoint: "not-a-url", APIKey: ""})
+	panda, err := evpanda.Start(evpanda.Config{Endpoint: "not-a-url", APIKey: ""})
 	if err == nil {
 		t.Fatal("Start on a bad config must return an error")
 	}
-	if sdk == nil {
+	if panda == nil {
 		t.Fatal("Start must never return nil, even on bad config")
 	}
 	// All of these must be safe no-ops on the inert SDK.
-	sdk.CaptureOCPI(makeOCPI(1))
-	sdk.CaptureOCPP(evpanda.OCPPMessage{})
-	if err := sdk.Flush(); err != nil {
+	panda.CaptureOCPI(makeOCPI(1))
+	panda.CaptureOCPP(evpanda.OCPPMessage{})
+	if err := panda.Flush(); err != nil {
 		t.Fatalf("inert Flush returned %v, want nil", err)
 	}
-	if err := sdk.Close(); err != nil {
+	if err := panda.Close(); err != nil {
 		t.Fatalf("inert Close returned %v, want nil", err)
 	}
 }
@@ -414,16 +410,46 @@ func TestAPIKeyFromEnv(t *testing.T) {
 
 	// Env var set, Config.APIKey empty → resolves from the environment.
 	t.Setenv("EVPANDA_API_KEY", "env-key")
-	sdk, err := evpanda.Start(base)
+	panda, err := evpanda.Start(base)
 	if err != nil {
 		t.Fatalf("Start with EVPANDA_API_KEY set returned %v", err)
 	}
-	defer sdk.Close()
+	defer panda.Close()
 
-	sdk.CaptureOCPI(makeOCPI(1))
-	sdk.Flush()
+	panda.CaptureOCPI(makeOCPI(1))
+	panda.Flush()
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == 1 }, 3*time.Second)
 	if got := mock.ocpiPosts()[0].headers.Get("x-api-key"); got != "env-key" {
 		t.Fatalf("x-api-key = %q, want env-key", got)
 	}
+}
+
+// DrainTimeout: 0 ⇒ default (ok); a positive value below the 5s minimum
+// is rejected (inert client + error).
+func TestDrainTimeoutMinimum(t *testing.T) {
+	mock := startMockUpstream()
+	defer mock.close()
+
+	base := evpanda.Config{
+		NetworkType: evpanda.ProtocolOCPI,
+		Endpoint:    mock.server.URL,
+		APIKey:      "k",
+	}
+
+	base.DrainTimeout = 0 // ⇒ default 10s
+	if _, err := evpanda.Start(base); err != nil {
+		t.Fatalf("DrainTimeout 0 should use the default, got error: %v", err)
+	}
+
+	base.DrainTimeout = 2 * time.Second // below the 5s minimum
+	if _, err := evpanda.Start(base); err == nil {
+		t.Fatal("DrainTimeout below 5s must be rejected")
+	}
+
+	base.DrainTimeout = 5 * time.Second // exactly the minimum → ok
+	panda, err := evpanda.Start(base)
+	if err != nil {
+		t.Fatalf("DrainTimeout 5s should be accepted, got: %v", err)
+	}
+	panda.Close()
 }

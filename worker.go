@@ -1,8 +1,3 @@
-// Port of src/worker.ts. Single non-reentrant worker. A goroutine polls on
-// a ticker so a slow flush never overlaps the next. Flushes on count ≥
-// batchCap or flushInterval, drains, then POSTs via transport (which owns
-// retry). Also owns the bounded shutdown drain. Never panics.
-
 package evpanda
 
 import (
@@ -12,16 +7,16 @@ import (
 	"time"
 )
 
-// ErrDrainIncomplete is returned by Close when the drain deadline elapsed
-// with messages still buffered — i.e. some captured data may have been
+// ErrDrainIncomplete is returned by [Client.Close] when the drain deadline
+// elapses with messages still buffered, meaning some captured data was
 // dropped on shutdown.
 var ErrDrainIncomplete = errors.New("evpanda: close drain deadline exceeded with messages still buffered")
 
-// batchCap is the server batch cap — also the size-based flush trigger.
+// batchCap is the maximum records per request and the size-based flush
+// trigger.
 const batchCap = 1000
 
-// pollInterval is the granularity for the size trigger (producers don't
-// push; the worker polls, mirroring the Node POLL_MS timer).
+// pollInterval is how often the worker checks the size-based flush trigger.
 const pollInterval = 500 * time.Millisecond
 
 type worker struct {
@@ -33,8 +28,7 @@ type worker struct {
 	stopCh   chan struct{}
 	doneCh   chan struct{} // closed when the loop goroutine exits
 
-	// flushMu serializes flushes so they never overlap (the worker's
-	// "single non-reentrant" property).
+	// flushMu serializes flushes so they never overlap.
 	flushMu sync.Mutex
 
 	lastMu    sync.Mutex
@@ -51,7 +45,7 @@ func newWorker(b *ringBuffer, t *transport, c resolvedConfig) *worker {
 	}
 }
 
-// start arms the polling goroutine.
+// start launches the polling goroutine.
 func (w *worker) start() {
 	w.setLastFlush(time.Now())
 	go w.loop()
@@ -73,31 +67,26 @@ func (w *worker) loop() {
 	}
 }
 
-// flushOnce runs one flush, serialized against any other flushOnce so the
-// loop and a concurrent Flush() never overlap.
+// flushOnce runs one flush, serialized so it never overlaps another.
 func (w *worker) flushOnce() {
 	w.flushMu.Lock()
 	defer w.flushMu.Unlock()
 	w.runFlush(context.Background())
 }
 
-// stop halts the polling loop. No drain — close owns the final drain. An
-// in-flight loop flush is NOT cancelled (it finishes best-effort in the
-// background, like the Node SDK's detached inflight); close only bounds how
-// long it *waits* for the loop to exit.
+// stop halts the polling loop. An in-flight flush is not cancelled; close
+// only bounds how long it waits for the loop to exit.
 func (w *worker) stop() {
 	w.stopOnce.Do(func() { close(w.stopCh) })
 }
 
-// close is one-shot and idempotent: stop the loop, join any in-flight
-// flush, then a bounded final drain. deadline ≤ 0 ⇒ configured
-// drainTimeout. Returns ErrDrainIncomplete if the deadline elapsed before
-// everything was drained; nil on a clean drain (or on an already-closed,
-// idempotent re-call).
+// close stops the loop and drains the buffer, bounded by deadline (≤ 0
+// uses the configured DrainTimeout). It is idempotent and returns
+// ErrDrainIncomplete if the deadline elapsed before the buffer emptied.
 func (w *worker) close(deadline time.Duration) error {
 	select {
 	case <-w.stopCh:
-		return nil // already closed — a prior close already reported
+		return nil // already closed
 	default:
 	}
 	w.stop()
@@ -108,10 +97,8 @@ func (w *worker) close(deadline time.Duration) error {
 	ctx, cancel := context.WithTimeout(context.Background(), deadline)
 	defer cancel()
 
-	// Wait for the loop goroutine to exit, but never past the deadline
-	// (mirrors the Node close() Promise.race against a cap timer). A
-	// loop-initiated flush blocks the loop's exit, so this also waits out
-	// that flush, bounded by the deadline.
+	// Wait for the loop to exit (which also waits out an in-flight flush),
+	// bounded by the deadline.
 	select {
 	case <-w.doneCh:
 	case <-ctx.Done():
@@ -128,8 +115,6 @@ func (w *worker) close(deadline time.Duration) error {
 	}
 	return nil
 }
-
-// ── internal ──────────────────────────────────────────────────────────────
 
 func (w *worker) setLastFlush(t time.Time) {
 	w.lastMu.Lock()
@@ -155,12 +140,11 @@ func (w *worker) runFlush(ctx context.Context) {
 		return
 	}
 
-	// One Client serves a single protocol (Config.NetworkType), so the
-	// whole batch ships to one endpoint — just chunk at batchCap.
+	// A Client serves one protocol, so the whole batch goes to one
+	// endpoint, chunked at batchCap.
 	protocol := w.config.protocol
 	for i := 0; i < len(batch); i += batchCap {
 		end := min(i+batchCap, len(batch))
-		// transport owns retry; the worker sends once and moves on.
 		w.transport.send(ctx, protocol, batch[i:end])
 	}
 }

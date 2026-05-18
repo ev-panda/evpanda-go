@@ -1,79 +1,72 @@
-// Port of src/types.ts. Hand-maintained message types; must match
-// apispec/ingestion-api.yaml (fixture pack). `protocol` is Client-wide
-// (Config.Protocol); `capturedAt` is the SDK-owned per-message receive
-// time (internal envelope, see buffer.go) — neither lives on these types.
-
 package evpanda
 
-// Protocol identifies the captured wire protocol. One Client serves a
-// single protocol (set via Config.Protocol).
+// Protocol is the wire protocol a Client serves, set via
+// Config.NetworkType.
 type Protocol string
 
 const (
-	// ProtocolOCPI — OCPI roaming HTTP traffic.
+	// ProtocolOCPI is OCPI roaming HTTP traffic.
 	ProtocolOCPI Protocol = "ocpi"
-	// ProtocolOCPP — OCPP charger WebSocket traffic.
+	// ProtocolOCPP is OCPP charger WebSocket traffic.
 	ProtocolOCPP Protocol = "ocpp"
 )
 
-// Direction is the message direction relative to the host.
+// Direction is a message's direction relative to the host.
 type Direction string
 
 const (
-	// Inbound — received by the host.
+	// Inbound is traffic received by the host.
 	Inbound Direction = "inbound"
-	// Outbound — sent by the host.
+	// Outbound is traffic sent by the host.
 	Outbound Direction = "outbound"
 )
 
-// OCPPEventType maps an OCPP WS lifecycle event to the ingestion
-// event_type. Numeric, matching the Node enum.
+// OCPPEventType is an OCPP WebSocket lifecycle event.
 type OCPPEventType int
 
 const (
-	// OCPPEventTypeDisconnect — WebSocket closed.
+	// OCPPEventTypeDisconnect indicates the WebSocket closed.
 	OCPPEventTypeDisconnect OCPPEventType = 0
-	// OCPPEventTypeConnect — WebSocket established.
+	// OCPPEventTypeConnect indicates the WebSocket was established.
 	OCPPEventTypeConnect OCPPEventType = 1
-	// OCPPEventTypeMessage — a message frame.
+	// OCPPEventTypeMessage indicates a message frame.
 	OCPPEventTypeMessage OCPPEventType = 2
 )
 
-// CapturedHTTP is a captured HTTP exchange. Body fields are []byte and
-// marshal to base64 in JSON (matching the Node Uint8Array→base64 wire
-// shape). Bodies are expected pre-truncated to MaxCaptureBytes by the
-// caller (the Node adapters did this; adapters are not ported).
+// CapturedHTTP is a captured HTTP exchange. The caller is responsible for
+// truncating bodies to Config.MaxCaptureBytes.
 type CapturedHTTP struct {
-	Method          string            `json:"method"`
-	URL             string            `json:"url"`
-	StatusCode      int               `json:"statusCode,omitempty"`
-	RequestHeaders  map[string]string `json:"requestHeaders"`
-	ResponseHeaders map[string]string `json:"responseHeaders"`
-	RequestBody     []byte            `json:"requestBody,omitempty"`
-	ResponseBody    []byte            `json:"responseBody,omitempty"`
-	Truncated       bool              `json:"truncated"`
+	Method          string
+	URL             string
+	StatusCode      int
+	RequestHeaders  map[string]string
+	ResponseHeaders map[string]string
+	RequestBody     []byte
+	ResponseBody    []byte
 }
 
-// OCPIMessage is a captured OCPI HTTP message.
+// OCPIMessage is a captured OCPI HTTP message. Pass it to Client.CaptureOCPI.
 type OCPIMessage struct {
-	Direction Direction       `json:"direction"`
-	Identity  RoamingIdentity `json:"identity"`
-	HTTP      CapturedHTTP    `json:"http"`
+	Direction Direction
+	Identity  RoamingIdentity
+	HTTP      CapturedHTTP
 }
 
-// OCPPMessage is a captured OCPP WebSocket event.
+// OCPPMessage is a captured OCPP WebSocket event. Pass it to
+// Client.CaptureOCPP.
 type OCPPMessage struct {
-	EventType OCPPEventType   `json:"eventType"`
-	Identity  ChargerIdentity `json:"identity"`
-	// ConnectionID is an SDK-owned UUID, stable per connection, regenerated
-	// on reconnect (supplied by the caller).
-	ConnectionID string `json:"connectionId"`
-	Payload      []byte `json:"payload,omitempty"`
-	Truncated    bool   `json:"truncated"`
+	EventType OCPPEventType
+	Identity  ChargerIdentity
+	// ConnectionID is a caller-supplied identifier, stable for the life of
+	// a connection.
+	ConnectionID string
+	// Direction is optional for OCPP.
+	Direction Direction
+	Payload   []byte
 }
 
-// anyMessage is either captured message shape — used where the protocol is
-// not statically known (buffer/transport). Unexported: not a customer type.
+// anyMessage is an OCPIMessage or OCPPMessage; it lets the buffer hold
+// either without a protocol tag.
 type anyMessage interface {
 	isMessage()
 }

@@ -1,51 +1,41 @@
-// Port of src/identity.ts. Per-message identity: shapes + validation. Two
-// independent shapes (no shared base). validate* is the single rule;
-// nothing here panics — absent/invalid ⇒ caller drops the message.
-//
-// The Node IdentityResolver / IdentityInput generics are part of the
-// adapter (pull) path and are intentionally not ported.
-
 package evpanda
 
 import "strings"
 
-// RoamingIdentity is the OCPI roaming context. platformId/platformName
-// required; tenant is all-or-nothing.
+// RoamingIdentity is the OCPI roaming context for a message. PlatformID
+// and PlatformName are required; TenantID and TenantName are optional but
+// all-or-nothing (supply both or neither).
 type RoamingIdentity struct {
-	PlatformID   string `json:"platformId"`
-	PlatformName string `json:"platformName"`
-	TenantID     string `json:"tenantId,omitempty"`
-	TenantName   string `json:"tenantName,omitempty"`
+	PlatformID   string
+	PlatformName string
+	TenantID     string
+	TenantName   string
 }
 
-// ChargerIdentity is the OCPP charger context. chargerId required; tenant
-// is all-or-nothing.
+// ChargerIdentity is the OCPP charger context for a message. ChargerID is
+// required; TenantID and TenantName are optional but all-or-nothing.
 type ChargerIdentity struct {
-	ChargerID  string `json:"chargerId"`
-	TenantID   string `json:"tenantId,omitempty"`
-	TenantName string `json:"tenantName,omitempty"`
+	ChargerID  string
+	TenantID   string
+	TenantName string
 }
 
-// isNonEmpty: present and not blank.
 func isNonEmpty(v string) bool {
 	return strings.TrimSpace(v) != ""
 }
 
-// isTenantPairValid: both tenantId & tenantName, or neither.
+// isTenantPairValid reports whether tenant ID and name are both set or
+// both empty.
 func isTenantPairValid(tenantID, tenantName string) bool {
 	return isNonEmpty(tenantID) == isNonEmpty(tenantName)
 }
 
-// validateRoamingIdentity is true iff platformId + platformName are
-// non-empty and tenant is all-or-nothing.
 func validateRoamingIdentity(id RoamingIdentity) bool {
 	return isNonEmpty(id.PlatformID) &&
 		isNonEmpty(id.PlatformName) &&
 		isTenantPairValid(id.TenantID, id.TenantName)
 }
 
-// validateChargerIdentity is true iff chargerId is non-empty and tenant is
-// all-or-nothing.
 func validateChargerIdentity(id ChargerIdentity) bool {
 	return isNonEmpty(id.ChargerID) &&
 		isTenantPairValid(id.TenantID, id.TenantName)

@@ -1,47 +1,37 @@
-// Port of src/instrumentation.ts. The two stable capture primitives — the
-// single chokepoint. Order: stamp protocol+capturedAt → validate identity
-// (invalid ⇒ drop) → redact → enqueue. May panic on pathological input;
-// the Client facade isolates it (recover).
-
 package evpanda
 
 import "strings"
 
+// captureOCPI validates, redacts, and buffers an OCPI message. Messages
+// with an invalid identity are dropped.
 func captureOCPI(buf *ringBuffer, msg OCPIMessage) {
 	capturedAt := nowISO()
 	if !validateRoamingIdentity(msg.Identity) {
-		return // drop, never panic
+		return
 	}
-	buf.enqueue(bufferedMessage{
-		capturedAt: capturedAt,
-		message:    redact(msg),
-	})
+	buf.enqueue(bufferedMessage{capturedAt: capturedAt, message: redact(msg)})
 }
 
+// captureOCPP validates and buffers an OCPP message. Messages with an
+// invalid identity are dropped.
 func captureOCPP(buf *ringBuffer, msg OCPPMessage) {
 	capturedAt := nowISO()
 	if !validateChargerIdentity(msg.Identity) {
-		return // drop, never panic
+		return
 	}
-	buf.enqueue(bufferedMessage{
-		capturedAt: capturedAt,
-		message:    redact(msg),
-	})
+	buf.enqueue(bufferedMessage{capturedAt: capturedAt, message: redact(msg)})
 }
 
-// ── Redaction (internal, always-on header denylist; no customer hook) ────
-
-// defaultHeaderDenylist is always stripped (lowercase; matched
-// case-insensitively).
+// defaultHeaderDenylist is the set of headers stripped before buffering,
+// matched case-insensitively.
 var defaultHeaderDenylist = map[string]struct{}{
 	"authorization": {},
 	"x-api-key":     {},
 	"cookie":        {},
 }
 
-// stripHeaders copies headers minus the denylisted ones (case-insensitive).
-// Always returns a non-nil map so the JSON shape is {} (not null), matching
-// the Node SDK.
+// stripHeaders returns a copy of h without the denylisted headers. The
+// result is always non-nil.
 func stripHeaders(h map[string]string) map[string]string {
 	out := make(map[string]string, len(h))
 	for k, v := range h {
@@ -52,12 +42,12 @@ func stripHeaders(h map[string]string) map[string]string {
 	return out
 }
 
-// redact strips denylisted headers. Non-mutating (returns a copy); OCPP is
-// unchanged (nothing to strip).
+// redact returns msg with denylisted HTTP headers removed. It does not
+// mutate the input; OCPP messages are returned unchanged.
 func redact(msg anyMessage) anyMessage {
 	m, ok := msg.(OCPIMessage)
 	if !ok {
-		return msg // OCPP: nothing to strip
+		return msg
 	}
 	m.HTTP.RequestHeaders = stripHeaders(m.HTTP.RequestHeaders)
 	m.HTTP.ResponseHeaders = stripHeaders(m.HTTP.ResponseHeaders)

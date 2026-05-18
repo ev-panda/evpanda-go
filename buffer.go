@@ -1,10 +1,3 @@
-// Port of src/buffer.ts. Fixed-size drop-oldest ring. No I/O: drain()
-// copies out and resets; the worker does the POST. Internal.
-//
-// Node relies on the event loop to serialize access and uses no lock. Go
-// capture calls arrive from arbitrary goroutines, so a sync.Mutex guards
-// the ring (the one structural deviation forced by the runtime model).
-
 package evpanda
 
 import (
@@ -13,15 +6,14 @@ import (
 	"time"
 )
 
-// bufferedMessage is the internal envelope: SDK-stamped capturedAt
-// (receive time) wrapping the customer message. The protocol is Client-wide
-// (Config.NetworkType), so it is not stored per message.
+// bufferedMessage wraps a captured message with its receive time.
 type bufferedMessage struct {
 	capturedAt string
 	message    anyMessage
 }
 
-// ringBuffer is a fixed-capacity drop-oldest queue.
+// ringBuffer is a fixed-capacity, drop-oldest queue, safe for concurrent
+// use. Producers enqueue from any goroutine; the worker drains.
 type ringBuffer struct {
 	mu       sync.Mutex
 	buf      []bufferedMessage
@@ -40,8 +32,7 @@ func newRingBuffer(capacity int) (*ringBuffer, error) {
 	}, nil
 }
 
-// enqueue appends, dropping the oldest when full (advance head; the old
-// slot is overwritten below).
+// enqueue appends a message, dropping the oldest when at capacity.
 func (r *ringBuffer) enqueue(env bufferedMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -54,7 +45,7 @@ func (r *ringBuffer) enqueue(env bufferedMessage) {
 	r.buf[idx] = env
 }
 
-// drain returns live slots oldest→newest, clears refs, and resets.
+// drain removes and returns all buffered messages, oldest first.
 func (r *ringBuffer) drain() []bufferedMessage {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -62,25 +53,24 @@ func (r *ringBuffer) drain() []bufferedMessage {
 	for i := 0; i < r.count; i++ {
 		idx := (r.head + i) % r.capacity
 		out[i] = r.buf[idx]
-		r.buf[idx] = bufferedMessage{} // release ref
+		r.buf[idx] = bufferedMessage{} // release reference
 	}
 	r.head = 0
 	r.count = 0
 	return out
 }
 
-// length is the number of buffered messages.
+// length returns the number of buffered messages.
 func (r *ringBuffer) length() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.count
 }
 
-// timestampLayout is the wire timestamp format: RFC3339 with millisecond
-// precision and a UTC "Z" (matches the Node SDK's Date.toISOString()).
+// timestampLayout is RFC3339 with millisecond precision and a UTC "Z".
 const timestampLayout = "2006-01-02T15:04:05.000Z07:00"
 
-// nowISO renders the capture timestamp (UTC, millisecond precision).
+// nowISO returns the current time as a wire timestamp.
 func nowISO() string {
 	return time.Now().UTC().Format(timestampLayout)
 }

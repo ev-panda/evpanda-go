@@ -1,17 +1,14 @@
-// Port of src/transport.ts. Hand-rolled transport (stdlib net/http; the
-// sole dependency is github.com/klauspost/compress for zstd). Body: JSON;
-// gzip or zstd with an identity fallback; tiny payloads sent uncompressed.
-// Owns the bounded retry: 200 or 400/401/413 → done; 5xx/network →
-// backoff; the caller never retries. Never panics.
-
 package evpanda
 
 import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"time"
@@ -19,35 +16,23 @@ import (
 	"github.com/klauspost/compress/zstd"
 )
 
-// ── Backoff (module-private, fixed by design — not configurable) ─────────
-
+// Retry backoff bounds (fixed, not configurable).
 const (
 	backoffBase        = 500 * time.Millisecond
 	backoffMax         = 30 * time.Second
 	backoffMaxAttempts = 5
 )
 
-// nextDelay is the jittered backoff before a retry attempt: capped
-// exponential with full jitter. Only called for attempt ∈ [1,
-// backoffMaxAttempts), so no exhaustion sentinel is needed.
+// nextDelay returns the capped-exponential, fully-jittered backoff before
+// a retry attempt.
 func nextDelay(attempt int) time.Duration {
 	capped := min(backoffBase<<attempt, backoffMax)
 	return time.Duration(rand.Int64N(int64(capped)))
 }
 
-// ── API client ───────────────────────────────────────────────────────────
-//
-// A 1:1 wrapper over the two ingestion endpoints. TRANSPORT ONLY — no
-// buffering, retry policy, or telemetry. Hand-rolled over net/http; no
-// generated client (would pull heavy transitive deps into customer
-// production for two endpoints).
-
-// requestTimeout is the per-attempt cap so a hung connection still feeds
-// the backoff.
+// requestTimeout caps a single POST attempt.
 const requestTimeout = 30 * time.Second
 
-// Request header names and the JSON content type (net/http canonicalises
-// the keys on Set; defined in canonical form for clarity).
 const (
 	headerContentType     = "Content-Type"
 	headerContentEncoding = "Content-Encoding"
@@ -61,8 +46,8 @@ type apiClient struct {
 	http     *http.Client
 }
 
-// post issues a single POST /v1/{protocol}; drains the body, returns the
-// status code.
+// post issues one POST /v1/{protocol}, drains the response, and returns
+// the status code.
 func (c *apiClient) post(ctx context.Context, protocol Protocol, body []byte, encoding contentEncoding) (int, error) {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
@@ -83,11 +68,9 @@ func (c *apiClient) post(ctx context.Context, protocol Protocol, body []byte, en
 		return 0, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	_, _ = io.Copy(io.Discard, resp.Body) // release the socket; body unused
+	_, _ = io.Copy(io.Discard, resp.Body) // drain so the connection can be reused
 	return resp.StatusCode, nil
 }
-
-// ── Transport ────────────────────────────────────────────────────────────
 
 type contentEncoding string
 
@@ -97,44 +80,118 @@ const (
 	encodingZstd     contentEncoding = "zstd"
 )
 
-// compressMinBytes — below this raw size, compression isn't worth the CPU.
+// compressMinBytes is the size below which a payload is sent uncompressed.
 const compressMinBytes = 1024
 
-// wire envelopes: embed the message (its json tags promote to top level)
-// and add the SDK-owned protocol + capturedAt. Matches the Node wire shape.
-type ocpiWire struct {
-	OCPIMessage
-	Protocol   Protocol `json:"protocol"`
-	CapturedAt string   `json:"capturedAt"`
+// ocpiIngest and ocppIngest are the exact request payload shapes the
+// ingestion service accepts. Keep them in lock-step with that service.
+type ocpiIngest struct {
+	CapturedAt         string          `json:"captured_at"`
+	PlatformID         string          `json:"platform_id"`
+	PlatformName       string          `json:"platform_name"`
+	TenantID           string          `json:"tenant_id,omitempty"`
+	TenantName         string          `json:"tenant_name,omitempty"`
+	Direction          string          `json:"direction"`
+	HTTPMethod         string          `json:"http_method"`
+	URL                string          `json:"url"`
+	ResponseStatusCode int             `json:"response_status_code"`
+	RequestHeaders     json.RawMessage `json:"request_headers,omitempty"`
+	RequestBody        *string         `json:"request_body,omitempty"`
+	ResponseHeaders    json.RawMessage `json:"response_headers,omitempty"`
+	ResponseBody       *string         `json:"response_body,omitempty"`
 }
 
-type ocppWire struct {
-	OCPPMessage
-	Protocol   Protocol `json:"protocol"`
-	CapturedAt string   `json:"capturedAt"`
+type ocppIngest struct {
+	ChargerID    string  `json:"charger_id"`
+	ConnectionID string  `json:"connection_id"`
+	TenantID     string  `json:"tenant_id"`
+	TenantName   string  `json:"tenant_name"`
+	CapturedAt   string  `json:"captured_at"`
+	EventType    int     `json:"event_type"`
+	Direction    *string `json:"direction,omitempty"`
+	RawFrame     *string `json:"raw_frame,omitempty"`
 }
 
-// serialize turns the envelope batch into the JSON body, stamping the
-// Client-wide protocol on each record. []byte fields marshal to base64 via
-// encoding/json (matching Node's Uint8Array→base64).
-func serialize(batch []bufferedMessage, protocol Protocol) ([]byte, error) {
+// headersJSON marshals a header map to a JSON object, or nil to omit it
+// when empty.
+func headersJSON(h map[string]string) json.RawMessage {
+	if len(h) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(h)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// bodyB64 base64-encodes a body/frame to a *string, or nil to omit it
+// when empty.
+func bodyB64(b []byte) *string {
+	if len(b) == 0 {
+		return nil
+	}
+	s := base64.StdEncoding.EncodeToString(b)
+	return &s
+}
+
+func optStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// ingestBody is the request envelope: {"messages": [ <record>, ... ]}.
+type ingestBody struct {
+	Messages []any `json:"messages"`
+}
+
+// serialize maps the batch onto the ingestion wire structs and JSON-encodes
+// it inside the request envelope.
+func serialize(batch []bufferedMessage) ([]byte, error) {
 	records := make([]any, 0, len(batch))
 	for _, e := range batch {
 		switch m := e.message.(type) {
 		case OCPIMessage:
-			records = append(records, ocpiWire{m, protocol, e.capturedAt})
+			records = append(records, ocpiIngest{
+				CapturedAt:         e.capturedAt,
+				PlatformID:         m.Identity.PlatformID,
+				PlatformName:       m.Identity.PlatformName,
+				TenantID:           m.Identity.TenantID,
+				TenantName:         m.Identity.TenantName,
+				Direction:          string(m.Direction),
+				HTTPMethod:         m.HTTP.Method,
+				URL:                m.HTTP.URL,
+				ResponseStatusCode: m.HTTP.StatusCode,
+				RequestHeaders:     headersJSON(m.HTTP.RequestHeaders),
+				RequestBody:        bodyB64(m.HTTP.RequestBody),
+				ResponseHeaders:    headersJSON(m.HTTP.ResponseHeaders),
+				ResponseBody:       bodyB64(m.HTTP.ResponseBody),
+			})
 		case OCPPMessage:
-			records = append(records, ocppWire{m, protocol, e.capturedAt})
+			records = append(records, ocppIngest{
+				ChargerID:    m.Identity.ChargerID,
+				ConnectionID: m.ConnectionID,
+				TenantID:     m.Identity.TenantID,
+				TenantName:   m.Identity.TenantName,
+				CapturedAt:   e.capturedAt,
+				EventType:    int(m.EventType),
+				Direction:    optStr(string(m.Direction)),
+				RawFrame:     bodyB64(m.Payload),
+			})
 		}
 	}
-	return json.Marshal(records)
+	return json.Marshal(ingestBody{Messages: records})
 }
 
 type transport struct {
 	client *apiClient
-	// zstdEnc is non-nil when compression is "zstd" (the default); a nil
-	// encoder means gzip. The encoder is safe for concurrent EncodeAll.
+	// zstdEnc is non-nil for zstd (the default); nil means gzip. It is
+	// safe for concurrent EncodeAll.
 	zstdEnc *zstd.Encoder
+	// logger records dropped batches; nil means silent.
+	logger *slog.Logger
 }
 
 func newTransport(c resolvedConfig) *transport {
@@ -144,9 +201,10 @@ func newTransport(c resolvedConfig) *transport {
 			apiKey:   c.apiKey,
 			http:     &http.Client{}, // per-attempt deadline via context
 		},
+		logger: c.logger,
 	}
 	if c.compression == "zstd" {
-		// EncodeAll-only use; fall back to gzip if the encoder won't build.
+		// Fall back to gzip if the encoder won't build.
 		if enc, err := zstd.NewWriter(nil); err == nil {
 			t.zstdEnc = enc
 		}
@@ -154,9 +212,8 @@ func newTransport(c resolvedConfig) *transport {
 	return t
 }
 
-// compress encodes the body with the configured codec (zstd by default,
-// gzip if Config.Compression == "gzip"), degrading to identity on any
-// failure. Payloads below compressMinBytes are sent uncompressed.
+// compress encodes raw with the configured codec, degrading to identity
+// on any failure or for sub-compressMinBytes payloads.
 func (t *transport) compress(raw []byte) ([]byte, contentEncoding) {
 	if len(raw) < compressMinBytes {
 		return raw, encodingIdentity
@@ -175,38 +232,60 @@ func (t *transport) compress(raw []byte) ([]byte, contentEncoding) {
 	return b.Bytes(), encodingGzip
 }
 
-// send serializes → compresses → POSTs with internal bounded retry. Never
-// panics; a dropped batch is acceptable loss by design.
+// send serializes, compresses, and POSTs the batch with bounded retry:
+// 200 or 400/401/413 is terminal; 5xx and network errors back off and
+// retry. A batch that can't be delivered is dropped. Never panics.
 func (t *transport) send(ctx context.Context, protocol Protocol, batch []bufferedMessage) {
 	if len(batch) == 0 {
 		return
 	}
-	raw, err := serialize(batch, protocol)
+	raw, err := serialize(batch)
 	if err != nil {
-		return // unserializable batch → drop
+		return // unserializable batch is dropped
 	}
 	body, encoding := t.compress(raw)
 
+	lastStatus := 0
 	for attempt := 0; attempt < backoffMaxAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-time.After(nextDelay(attempt)):
 			case <-ctx.Done():
+				t.logDrop(protocol, len(batch), "context cancelled before retry")
 				return
 			}
 		}
 
 		status, err := t.client.post(ctx, protocol, body, encoding)
 		if err != nil {
-			continue // network error / timeout → retryable
+			lastStatus = 0
+			continue // network error / timeout: retry
 		}
-		// 200 accepted; 400/401/413 permanent (drop, never retry — only
-		// these three per the ingestion contract); any other → retryable.
+		lastStatus = status
 		switch status {
-		case http.StatusOK, http.StatusBadRequest,
-			http.StatusUnauthorized, http.StatusRequestEntityTooLarge:
+		case http.StatusOK:
+			return
+		case http.StatusBadRequest, http.StatusUnauthorized,
+			http.StatusRequestEntityTooLarge:
+			t.logDrop(protocol, len(batch), fmt.Sprintf("permanent rejection: HTTP %d", status))
 			return
 		}
 	}
-	// retries exhausted → batch dropped
+	if lastStatus != 0 {
+		t.logDrop(protocol, len(batch), fmt.Sprintf("retries exhausted (last HTTP %d)", lastStatus))
+	} else {
+		t.logDrop(protocol, len(batch), "retries exhausted (network error / timeout)")
+	}
+}
+
+// logDrop records a dropped batch when the debug logger is configured.
+func (t *transport) logDrop(protocol Protocol, n int, reason string) {
+	if t.logger == nil {
+		return
+	}
+	t.logger.Warn("evpanda: dropped batch (delivery failed)",
+		"protocol", string(protocol),
+		"messages", n,
+		"reason", reason,
+	)
 }

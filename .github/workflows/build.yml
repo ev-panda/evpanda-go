@@ -12,9 +12,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # go.mod floor is 1.22 (compress pinned to keep it low). Test
-        # the floor + tip.
-        go: ["1.22", "stable"]
+        # go.mod floor is 1.24 (latest klauspost/compress requires it).
+        # Test the floor + tip.
+        go: ["1.24", "stable"]
     steps:
       - uses: actions/checkout@v4
 
