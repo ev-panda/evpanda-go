@@ -1,14 +1,15 @@
 package evpanda
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"time"
 )
 
 type sdkImpl interface {
-	captureOCPI(OCPIMessage)
-	captureOCPP(OCPPMessage)
+	captureOCPI(context.Context, OCPIMessage)
+	captureOCPP(context.Context, OCPPMessage)
 	flush() error
 	shutdown(deadline time.Duration) error
 }
@@ -37,17 +38,31 @@ func newActiveSDK(c Config) (*activeSDK, error) {
 func (s *activeSDK) start() { s.worker.start() }
 
 // captureOCPI and captureOCPP buffer a message only when it matches the
-// configured protocol; otherwise they are no-ops.
-func (s *activeSDK) captureOCPI(m OCPIMessage) {
-	if s.networkType == ProtocolOCPI {
-		captureOCPI(s.buffer, m)
+// configured protocol; otherwise they are no-ops. When the message carries
+// no identity, it is resolved from ctx (see WithRoamingIdentity /
+// WithChargerIdentity); an explicit message identity always wins.
+func (s *activeSDK) captureOCPI(ctx context.Context, m OCPIMessage) {
+	if s.networkType != ProtocolOCPI {
+		return
 	}
+	if m.Identity == (RoamingIdentity{}) {
+		if id, ok := RoamingIdentityFromContext(ctx); ok {
+			m.Identity = id
+		}
+	}
+	captureOCPI(s.buffer, m)
 }
 
-func (s *activeSDK) captureOCPP(m OCPPMessage) {
-	if s.networkType == ProtocolOCPP {
-		captureOCPP(s.buffer, m)
+func (s *activeSDK) captureOCPP(ctx context.Context, m OCPPMessage) {
+	if s.networkType != ProtocolOCPP {
+		return
 	}
+	if m.Identity == (ChargerIdentity{}) {
+		if id, ok := ChargerIdentityFromContext(ctx); ok {
+			m.Identity = id
+		}
+	}
+	captureOCPP(s.buffer, m)
 }
 
 func (s *activeSDK) flush() error                   { s.worker.flushOnce(); return nil }
@@ -56,10 +71,10 @@ func (s *activeSDK) shutdown(d time.Duration) error { return s.worker.close(d) }
 // noopSDK is the inert implementation used when Start fails or after Close.
 type noopSDK struct{}
 
-func (noopSDK) captureOCPI(OCPIMessage)      {}
-func (noopSDK) captureOCPP(OCPPMessage)      {}
-func (noopSDK) flush() error                 { return nil }
-func (noopSDK) shutdown(time.Duration) error { return nil }
+func (noopSDK) captureOCPI(context.Context, OCPIMessage) {}
+func (noopSDK) captureOCPP(context.Context, OCPPMessage) {}
+func (noopSDK) flush() error                             { return nil }
+func (noopSDK) shutdown(time.Duration) error             { return nil }
 
 // Client captures and ships traffic. Construct it with [Start]; it is safe
 // for concurrent use.
@@ -106,16 +121,26 @@ func guardVoid(fn func()) {
 	fn()
 }
 
-// CaptureOCPI buffers an OCPI message for delivery. It is non-blocking and
-// never panics; a message with an invalid identity is silently dropped.
-func (e *Client) CaptureOCPI(msg OCPIMessage) {
-	guardVoid(func() { e.current().captureOCPI(msg) })
+// CaptureOCPI buffers an OCPI message for delivery. ctx is required; if
+// msg has no identity it is resolved from ctx (see WithRoamingIdentity).
+// Non-blocking and never panics; a message with an invalid identity is
+// silently dropped.
+func (e *Client) CaptureOCPI(ctx context.Context, msg OCPIMessage) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	guardVoid(func() { e.current().captureOCPI(ctx, msg) })
 }
 
-// CaptureOCPP buffers an OCPP message for delivery. It is non-blocking and
-// never panics; a message with an invalid identity is silently dropped.
-func (e *Client) CaptureOCPP(msg OCPPMessage) {
-	guardVoid(func() { e.current().captureOCPP(msg) })
+// CaptureOCPP buffers an OCPP message for delivery. ctx is required; if
+// msg has no identity it is resolved from ctx (see WithChargerIdentity).
+// Non-blocking and never panics; a message with an invalid identity is
+// silently dropped.
+func (e *Client) CaptureOCPP(ctx context.Context, msg OCPPMessage) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	guardVoid(func() { e.current().captureOCPP(ctx, msg) })
 }
 
 // Flush triggers immediate delivery of buffered messages. It never panics;

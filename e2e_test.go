@@ -1,15 +1,12 @@
-// Port of test/e2e.test.ts. Drives the public API against a mock upstream
-// (httptest) and asserts capture → batch → upstream, redaction, routing,
-// gzip + chunking, drop-oldest, graceful close, and "never panics".
-//
-// Go has no separate built artifact, so this is an in-package external
-// test (package evpanda_test) — the idiomatic equivalent of importing the
-// Node SDK's built dist.
+// End-to-end tests: drive the public API against an httptest upstream and
+// assert capture, batching, redaction, routing, compression, drop-oldest,
+// graceful close, identity resolution, and that nothing panics.
 
 package evpanda_test
 
 import (
 	"compress/gzip"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -26,8 +23,6 @@ import (
 
 	evpanda "github.com/ev-panda/evpanda-go"
 )
-
-// ── Mock upstream ────────────────────────────────────────────────────────
 
 type received struct {
 	path    string
@@ -112,8 +107,6 @@ func (m *mockUpstream) ocpiPosts() []received {
 
 func (m *mockUpstream) close() { m.server.Close() }
 
-// ── Helpers ──────────────────────────────────────────────────────────────
-
 func waitFor(t *testing.T, predicate func() bool, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -147,8 +140,6 @@ func makeOCPI(i int) evpanda.OCPIMessage {
 	}
 }
 
-// ── Tests ────────────────────────────────────────────────────────────────
-
 func TestCaptureBatchRedactRoute(t *testing.T) {
 	mock := startMockUpstream()
 	defer mock.close()
@@ -165,7 +156,7 @@ func TestCaptureBatchRedactRoute(t *testing.T) {
 	defer panda.Close()
 
 	for i := 0; i < 3; i++ {
-		panda.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(context.Background(), makeOCPI(i))
 	}
 
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == 3 }, 3*time.Second)
@@ -240,7 +231,7 @@ func TestGzipAndChunking(t *testing.T) {
 
 	const n = 2500
 	for i := 0; i < n; i++ {
-		panda.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(context.Background(), makeOCPI(i))
 	}
 
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == n }, 8*time.Second)
@@ -284,7 +275,7 @@ func TestDropOldest(t *testing.T) {
 	defer panda.Close()
 
 	for i := 0; i < 12; i++ { // 0..11
-		panda.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(context.Background(), makeOCPI(i))
 	}
 	panda.Flush() // force one drain
 
@@ -324,7 +315,7 @@ func TestFlushOnClose(t *testing.T) {
 	}
 
 	for i := 0; i < 4; i++ {
-		panda.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(context.Background(), makeOCPI(i))
 	}
 	if len(mock.ocpiRecords()) != 0 {
 		t.Fatalf("nothing should be sent yet, got %d", len(mock.ocpiRecords()))
@@ -355,12 +346,12 @@ func TestNeverPanicsWhenUpstreamFails(t *testing.T) {
 
 	// Capture during a failing upstream — must not panic.
 	for i := 0; i < 3; i++ {
-		panda.CaptureOCPI(makeOCPI(i))
+		panda.CaptureOCPI(context.Background(), makeOCPI(i))
 	}
 	// Malformed customer input — must not panic either (facade recovers).
-	panda.CaptureOCPI(evpanda.OCPIMessage{}) // invalid identity
-	panda.CaptureOCPP(evpanda.OCPPMessage{}) // invalid identity
-	panda.CaptureOCPI(makeOCPI(99))          // still usable
+	panda.CaptureOCPI(context.Background(), evpanda.OCPIMessage{}) // invalid identity
+	panda.CaptureOCPP(context.Background(), evpanda.OCPPMessage{}) // invalid identity
+	panda.CaptureOCPI(context.Background(), makeOCPI(99))          // still usable
 
 	panda.Flush() // resolves even though the upstream 400s
 
@@ -368,7 +359,7 @@ func TestNeverPanicsWhenUpstreamFails(t *testing.T) {
 		t.Fatalf("expected at least one delivery attempt")
 	}
 	// Still usable afterwards.
-	panda.CaptureOCPI(makeOCPI(100))
+	panda.CaptureOCPI(context.Background(), makeOCPI(100))
 	panda.Flush()
 }
 
@@ -382,8 +373,8 @@ func TestBadConfigIsInert(t *testing.T) {
 		t.Fatal("Start must never return nil, even on bad config")
 	}
 	// All of these must be safe no-ops on the inert SDK.
-	panda.CaptureOCPI(makeOCPI(1))
-	panda.CaptureOCPP(evpanda.OCPPMessage{})
+	panda.CaptureOCPI(context.Background(), makeOCPI(1))
+	panda.CaptureOCPP(context.Background(), evpanda.OCPPMessage{})
 	if err := panda.Flush(); err != nil {
 		t.Fatalf("inert Flush returned %v, want nil", err)
 	}
@@ -416,7 +407,7 @@ func TestAPIKeyFromEnv(t *testing.T) {
 	}
 	defer panda.Close()
 
-	panda.CaptureOCPI(makeOCPI(1))
+	panda.CaptureOCPI(context.Background(), makeOCPI(1))
 	panda.Flush()
 	waitFor(t, func() bool { return len(mock.ocpiRecords()) == 1 }, 3*time.Second)
 	if got := mock.ocpiPosts()[0].headers.Get("x-api-key"); got != "env-key" {
@@ -452,4 +443,64 @@ func TestDrainTimeoutMinimum(t *testing.T) {
 		t.Fatalf("DrainTimeout 5s should be accepted, got: %v", err)
 	}
 	panda.Close()
+}
+
+// Identity context helpers round-trip, are absent by default, and the two
+// shapes use independent keys.
+func TestIdentityContext(t *testing.T) {
+	ctx := context.Background()
+
+	if _, ok := evpanda.RoamingIdentityFromContext(ctx); ok {
+		t.Fatal("empty context must not yield a roaming identity")
+	}
+	if _, ok := evpanda.ChargerIdentityFromContext(ctx); ok {
+		t.Fatal("empty context must not yield a charger identity")
+	}
+
+	roaming := evpanda.RoamingIdentity{PlatformID: "acme", PlatformName: "Acme"}
+	charger := evpanda.ChargerIdentity{ChargerID: "CP-001"}
+
+	ctx = evpanda.WithRoamingIdentity(ctx, roaming)
+	ctx = evpanda.WithChargerIdentity(ctx, charger)
+
+	got1, ok := evpanda.RoamingIdentityFromContext(ctx)
+	if !ok || got1 != roaming {
+		t.Fatalf("roaming round-trip: got %+v, ok=%v", got1, ok)
+	}
+	got2, ok := evpanda.ChargerIdentityFromContext(ctx)
+	if !ok || got2 != charger {
+		t.Fatalf("charger round-trip: got %+v, ok=%v", got2, ok)
+	}
+}
+
+// CaptureOCPI resolves identity from ctx when the message carries none.
+func TestCaptureIdentityFromContext(t *testing.T) {
+	mock := startMockUpstream()
+	defer mock.close()
+
+	panda, err := evpanda.Start(evpanda.Config{
+		NetworkType:   evpanda.ProtocolOCPI,
+		Endpoint:      mock.server.URL,
+		APIKey:        "k",
+		FlushInterval: 100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer panda.Close()
+
+	ctx := evpanda.WithRoamingIdentity(context.Background(), evpanda.RoamingIdentity{
+		PlatformID:   "ctx-acme",
+		PlatformName: "Ctx Acme",
+	})
+	// Message with no Identity — it must be filled from ctx.
+	panda.CaptureOCPI(ctx, evpanda.OCPIMessage{
+		Direction: evpanda.Inbound,
+		HTTP:      evpanda.CapturedHTTP{Method: "POST", URL: "/ctx", StatusCode: 200},
+	})
+
+	waitFor(t, func() bool { return len(mock.ocpiRecords()) == 1 }, 3*time.Second)
+	if got := mock.ocpiRecords()[0]["platform_id"]; got != "ctx-acme" {
+		t.Fatalf("platform_id = %v, want ctx-acme (resolved from context)", got)
+	}
 }

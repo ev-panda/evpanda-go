@@ -18,7 +18,7 @@
 //	}
 //	defer panda.Close()
 //
-//	panda.CaptureOCPI(evpanda.OCPIMessage{ /* ... */ })
+//	panda.CaptureOCPI(ctx, evpanda.OCPIMessage{ /* ... */ })
 //
 // One Client serves a single protocol (Config.NetworkType); the other
 // Capture method is a no-op.

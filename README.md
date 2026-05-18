@@ -32,6 +32,7 @@ import "github.com/ev-panda/evpanda-go" // package evpanda
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/ev-panda/evpanda-go"
@@ -52,8 +53,11 @@ func main() {
 	// Close returns an error (e.g. evpanda.ErrDrainIncomplete) you may log.
 	defer func() { _ = panda.Close() }()
 
+	// In a handler this is the request context.
+	ctx := context.Background()
+
 	// OCPI message (e.g. from your inbound/outbound HTTP layer)
-	panda.CaptureOCPI(evpanda.OCPIMessage{
+	panda.CaptureOCPI(ctx, evpanda.OCPIMessage{
 		Direction: evpanda.Inbound,
 		Identity: evpanda.RoamingIdentity{
 			PlatformID:   "acme",
@@ -76,7 +80,7 @@ An OCPP agent is the same, with `NetworkType: evpanda.ProtocolOCPP` and
 `CaptureOCPP`:
 
 ```go
-panda.CaptureOCPP(evpanda.OCPPMessage{
+panda.CaptureOCPP(ctx, evpanda.OCPPMessage{
 	EventType:    evpanda.OCPPEventTypeMessage,
 	Identity:     evpanda.ChargerIdentity{ChargerID: "CP-001"},
 	ConnectionID: "conn-abc",
@@ -103,6 +107,25 @@ drops messages it can't attribute (it never panics back at you).
 Identity is per message, not global config — one OCPI process can serve
 many platforms and tenants; one OCPP process many chargers and tenants.
 (Protocol, by contrast, is Client-wide — see `NetworkType`.)
+
+`ctx` is **required** by `CaptureOCPI`/`CaptureOCPP`. To thread identity
+through call stacks, put it on the context once; capture fills it in when
+the message has no `Identity` (an explicit `msg.Identity` still wins):
+
+```go
+ctx = evpanda.WithRoamingIdentity(ctx, evpanda.RoamingIdentity{
+	PlatformID: "acme", PlatformName: "Acme Mobility",
+})
+
+// No Identity on the message — resolved from ctx.
+panda.CaptureOCPI(ctx, evpanda.OCPIMessage{ /* HTTP, Direction, ... */ })
+```
+
+`RoamingIdentityFromContext` / `ChargerIdentityFromContext` are also
+exported if you need to read it back yourself. `WithChargerIdentity` is
+the OCPP equivalent. Keys are package-private, so they won't collide with
+other
+context values.
 
 ## Configuration
 
