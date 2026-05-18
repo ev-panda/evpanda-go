@@ -1,0 +1,18 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # github.com/klauspost/compress is intentionally pinned to v1.18.0 —
+      # the newest release whose go.mod still allows go 1.22, which keeps
+      # this embedded SDK's consumer Go floor low. A bump must be a
+      # conscious decision (raise go.mod `go` + the CI matrix together), so
+      # Dependabot must not propose it.
+      - dependency-name: "github.com/klauspost/compress"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly

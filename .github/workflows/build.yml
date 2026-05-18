@@ -1,0 +1,45 @@
+name: Build
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # go.mod floor is 1.22 (compress pinned to keep it low). Test
+        # the floor + tip.
+        go: ["1.22", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go build ./...
+
+      - run: go vet ./...
+
+      # Lint once (on the newest Go), in this same job. action @v7 ships
+      # golangci-lint v2 (v6 is the last v1 line); version pinned to match
+      # the v2 config schema in .golangci.yml.
+      - if: matrix.go == 'stable'
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.10.1
+
+      # -race exercises the buffer mutex / worker goroutine under contention.
+      - run: go test -race -count=1 ./...

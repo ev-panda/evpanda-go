@@ -1,0 +1,25 @@
+# Go modules are "published" by pushing a semver git tag — there is no
+# registry upload step (consumers fetch via `go get ...@vX.Y.Z` straight
+# from the proxy). This workflow is a release *gate*: it re-runs the full
+# suite on the tag so a broken commit can't be tagged silently.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Verify tagged commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 ./...

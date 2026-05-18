@@ -1,0 +1,32 @@
+# golangci-lint v2 config — runs in CI (.github/workflows/ci.yml) and
+# locally via `make lint`. Industry-standard set; deliberately not exotic so
+# the build stays green and the signal stays high.
+#
+# The v2 "standard" default already includes: errcheck, govet, ineffassign,
+# staticcheck (incl. gosimple), unused.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose   # HTTP response body always closed
+    - misspell    # common misspellings
+    - revive      # golint successor (style)
+    - unconvert   # redundant conversions
+  exclusions:
+    rules:
+      # Tests intentionally take shortcuts (ignored Close on the mock
+      # server, ignored Unmarshal errors, etc.).
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+
+# In v2, formatters are a separate stage from linters.
+formatters:
+  enable:
+    - gofmt
+    - goimports
