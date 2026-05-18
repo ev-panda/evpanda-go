@@ -85,31 +85,33 @@ const compressMinBytes = 1024
 
 // ocpiIngest and ocppIngest are the exact request payload shapes the
 // ingestion service accepts. Keep them in lock-step with that service.
+// Optional fields are pointers / json.RawMessage without omitempty so an
+// absent value serializes as JSON null — never a Go zero value ("" / 0).
 type ocpiIngest struct {
 	CapturedAt         string          `json:"captured_at"`
 	PlatformID         string          `json:"platform_id"`
 	PlatformName       string          `json:"platform_name"`
-	TenantID           string          `json:"tenant_id,omitempty"`
-	TenantName         string          `json:"tenant_name,omitempty"`
+	TenantID           *string         `json:"tenant_id"`
+	TenantName         *string         `json:"tenant_name"`
 	Direction          string          `json:"direction"`
 	HTTPMethod         string          `json:"http_method"`
 	URL                string          `json:"url"`
-	ResponseStatusCode int             `json:"response_status_code"`
-	RequestHeaders     json.RawMessage `json:"request_headers,omitempty"`
-	RequestBody        *string         `json:"request_body,omitempty"`
-	ResponseHeaders    json.RawMessage `json:"response_headers,omitempty"`
-	ResponseBody       *string         `json:"response_body,omitempty"`
+	ResponseStatusCode *int            `json:"response_status_code"`
+	RequestHeaders     json.RawMessage `json:"request_headers"`
+	RequestBody        *string         `json:"request_body"`
+	ResponseHeaders    json.RawMessage `json:"response_headers"`
+	ResponseBody       *string         `json:"response_body"`
 }
 
 type ocppIngest struct {
 	ChargerID    string  `json:"charger_id"`
 	ConnectionID string  `json:"connection_id"`
-	TenantID     string  `json:"tenant_id"`
-	TenantName   string  `json:"tenant_name"`
+	TenantID     *string `json:"tenant_id"`
+	TenantName   *string `json:"tenant_name"`
 	CapturedAt   string  `json:"captured_at"`
 	EventType    int     `json:"event_type"`
-	Direction    *string `json:"direction,omitempty"`
-	RawFrame     *string `json:"raw_frame,omitempty"`
+	Direction    *string `json:"direction"`
+	RawFrame     *string `json:"raw_frame"`
 }
 
 // headersJSON marshals a header map to a JSON object, or nil to omit it
@@ -142,6 +144,15 @@ func optStr(s string) *string {
 	return &s
 }
 
+// optInt returns nil for 0 (treated as "absent") so the field serializes
+// as null rather than 0.
+func optInt(v int) *int {
+	if v == 0 {
+		return nil
+	}
+	return &v
+}
+
 // ingestBody is the request envelope: {"messages": [ <record>, ... ]}.
 type ingestBody struct {
 	Messages []any `json:"messages"`
@@ -158,12 +169,12 @@ func serialize(batch []bufferedMessage) ([]byte, error) {
 				CapturedAt:         e.capturedAt,
 				PlatformID:         m.Identity.PlatformID,
 				PlatformName:       m.Identity.PlatformName,
-				TenantID:           m.Identity.TenantID,
-				TenantName:         m.Identity.TenantName,
+				TenantID:           optStr(m.Identity.TenantID),
+				TenantName:         optStr(m.Identity.TenantName),
 				Direction:          string(m.Direction),
 				HTTPMethod:         m.HTTP.Method,
 				URL:                m.HTTP.URL,
-				ResponseStatusCode: m.HTTP.StatusCode,
+				ResponseStatusCode: optInt(m.HTTP.StatusCode),
 				RequestHeaders:     headersJSON(m.HTTP.RequestHeaders),
 				RequestBody:        bodyB64(m.HTTP.RequestBody),
 				ResponseHeaders:    headersJSON(m.HTTP.ResponseHeaders),
@@ -173,8 +184,8 @@ func serialize(batch []bufferedMessage) ([]byte, error) {
 			records = append(records, ocppIngest{
 				ChargerID:    m.Identity.ChargerID,
 				ConnectionID: m.ConnectionID,
-				TenantID:     m.Identity.TenantID,
-				TenantName:   m.Identity.TenantName,
+				TenantID:     optStr(m.Identity.TenantID),
+				TenantName:   optStr(m.Identity.TenantName),
 				CapturedAt:   e.capturedAt,
 				EventType:    int(m.EventType),
 				Direction:    optStr(string(m.Direction)),
